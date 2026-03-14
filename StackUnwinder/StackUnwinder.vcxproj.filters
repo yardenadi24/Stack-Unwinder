@@ -21,9 +21,15 @@
     <ClCompile Include="StackUnwinderTest.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="stack_unwinder_pdb.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="stack_unwinder.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="stack_unwinder_pdb.h">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

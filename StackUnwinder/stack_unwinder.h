@@ -178,6 +178,13 @@ typedef struct _UNWIND_CONTEXT {
     MODULE_INFO         Modules[MAX_MODULES];
     INT32               ModuleCount;
 
+    /* Auto-discovery: when enabled, UnwinderWalk will scan backward
+       from unknown RIPs to find PE image bases, register them, and
+       use their .pdata + exports for proper unwinding — all inline,
+       no OS APIs needed. */
+    BOOLEAN             AutoDiscover;
+    UINT64              MaxScanSize;    /* How far back to scan (bytes) */
+
     /* Output */
     STACK_FRAME_ENTRY   Frames[MAX_STACK_FRAMES];
     INT32               FrameCount;
@@ -205,6 +212,24 @@ UnwinderAddModule(
 );
 
 /*
+ * UnwinderEnableAutoDiscovery — turn on inline module discovery.
+ *
+ * When enabled, UnwinderWalk will automatically scan backward from
+ * any RIP that doesn't belong to a known module, find its PE image
+ * base, read the DLL name from the export directory, register it,
+ * and use its .pdata for proper structured unwinding — all in a
+ * single pass, no OS APIs needed.
+ *
+ * MaxScanSize — how far back (bytes) to scan. 32 MB is a safe default.
+ *               Pass 0 to disable auto-discovery.
+ */
+VOID
+UnwinderEnableAutoDiscovery(
+    _Inout_ PUNWIND_CONTEXT Context,
+    _In_    UINT64           MaxScanSize
+);
+
+/*
  * UnwinderWalk — walk the stack starting from (Rip, Rsp).
  *
  * InitialGpr (optional):
@@ -222,6 +247,55 @@ UnwinderWalk(
 );
 
 /*
+ * UnwinderFindImageBase — scan backward from an address to find the
+ * PE image base.
+ *
+ * Walks backward from `Address` on page-aligned (0x1000) boundaries,
+ * checking for a valid MZ + PE signature.  Searches up to `MaxScanSize`
+ * bytes back (default recommendation: 32 MB).
+ *
+ * On success, stores the image base in *ImageBase and the value of
+ * SizeOfImage from the PE optional header in *SizeOfImage, then
+ * returns TRUE.
+ *
+ * This is the primary module-discovery mechanism when OS loader
+ * structures (PsLoadedModuleList, PEB) are not yet available —
+ * e.g. during early boot or from a Type-1 hypervisor VM exit
+ * before Windows has fully initialized.
+ */
+BOOLEAN
+UnwinderFindImageBase(
+    _Inout_ PUNWIND_CONTEXT Context,
+    _In_    UINT64           Address,
+    _In_    UINT64           MaxScanSize,
+    _Out_   UINT64* ImageBase,
+    _Out_   UINT64* SizeOfImage
+);
+
+/*
+ * UnwinderDiscoverModules — auto-discover and register modules for
+ * all frames after UnwinderWalk.
+ *
+ * For each frame whose RIP doesn't already belong to a known module,
+ * calls UnwinderFindImageBase to scan backward for the PE header,
+ * and registers any newly found image via UnwinderAddModule.
+ *
+ * Call this between UnwinderWalk and UnwinderResolveExports when you
+ * have no other way to enumerate loaded modules (e.g. early boot,
+ * hypervisor with no guest OS structures).
+ *
+ * MaxScanSize — how far back (in bytes) to scan from each RIP.
+ *               32 * 1024 * 1024 (32 MB) is a safe default.
+ *
+ * Returns the number of new modules discovered.
+ */
+INT32
+UnwinderDiscoverModules(
+    _Inout_ PUNWIND_CONTEXT Context,
+    _In_    UINT64           MaxScanSize
+);
+
+/*
  * UnwinderResolveExports — after UnwinderWalk, fill in FunctionName
  * for each frame by looking up the nearest PE export symbol.
  *
@@ -234,20 +308,25 @@ UnwinderResolveExports(
 );
 
 /*
- * PRINT_FN — callback for printing a single line of output.
- * Signature matches printf. If NULL is passed to UnwinderPrintTrace,
- * no output is produced.
- */
-typedef int (*PRINT_FN)(const char* Fmt, ...);
-
-/*
- * UnwinderPrintTrace — print the stack trace to the given output function.
+ * UnwinderFormatTrace — format the stack trace into a caller-supplied buffer.
  *
  * Call after UnwinderWalk (and optionally UnwinderResolveExports).
- * Pass printf, DbgPrintEx wrapper, or any printf-compatible function.
+ *
+ * Buffer   — destination buffer, or NULL to query required size.
+ * BufSize  — size of Buffer in bytes.
+ *
+ * Returns the number of characters written (excluding null terminator).
+ * If Buffer is NULL or BufSize is 0, returns the required buffer size
+ * (including null terminator) so the caller can allocate.
+ *
+ * Usage pattern:
+ *   INT32 needed = UnwinderFormatTrace(&uc, NULL, 0);
+ *   CHAR* buf = (CHAR*)alloc(needed);
+ *   UnwinderFormatTrace(&uc, buf, needed);
  */
-VOID
-UnwinderPrintTrace(
-    _In_ PUNWIND_CONTEXT Context,
-    _In_ PRINT_FN        PrintFn
+INT32
+UnwinderFormatTrace(
+    _In_                              PUNWIND_CONTEXT Context,
+    _Out_writes_opt_(BufSize) CHAR* Buffer,
+    _In_                              INT32           BufSize
 );

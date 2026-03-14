@@ -54,6 +54,14 @@ static void StrCopyA(
     Dest[i] = '\0';
 }
 
+static INT32 StrLenA(const CHAR* S)
+{
+    INT32 n = 0;
+    if (!S) return 0;
+    while (S[n]) n++;
+    return n;
+}
+
 static __forceinline BOOLEAN
 SafeRead(UNWIND_CONTEXT* Ctx, void* Dest, UINT64 Addr, UINT64 Size)
 {
@@ -78,6 +86,151 @@ ReadU64(UNWIND_CONTEXT* Ctx, UINT64 Addr, UINT64* Out)
 {
     return SafeRead(Ctx, Out, Addr, sizeof(UINT64));
 }
+
+/* ================================================================== */
+/*  CRT-free string formatting helpers                                */
+/* ================================================================== */
+
+/*
+ * TRACE_BUFFER — lightweight write cursor for building the trace string.
+ * When Buf is NULL we just count characters (sizing pass).
+ */
+typedef struct _TRACE_BUFFER {
+    CHAR* Buf;
+    INT32  Size;     /* Total buffer size            */
+    INT32  Pos;      /* Current write position       */
+} TRACE_BUFFER;
+
+static void
+TbInit(TRACE_BUFFER* Tb, CHAR* Buf, INT32 Size)
+{
+    Tb->Buf = Buf;
+    Tb->Size = Size;
+    Tb->Pos = 0;
+}
+
+/* Append a single character */
+static void
+TbPutChar(TRACE_BUFFER* Tb, CHAR Ch)
+{
+    if (Tb->Buf && Tb->Pos < Tb->Size - 1)
+        Tb->Buf[Tb->Pos] = Ch;
+    Tb->Pos++;
+}
+
+/* Append a null-terminated string */
+static void
+TbPutStr(TRACE_BUFFER* Tb, const CHAR* S)
+{
+    if (!S) return;
+    while (*S) {
+        TbPutChar(Tb, *S);
+        S++;
+    }
+}
+
+/* Append a decimal integer (INT32) */
+static void
+TbPutDec(TRACE_BUFFER* Tb, INT32 Value)
+{
+    CHAR  tmp[16];
+    INT32 i = 0;
+    BOOLEAN neg = FALSE;
+
+    if (Value < 0) {
+        neg = TRUE;
+        Value = -Value;
+    }
+    if (Value == 0) {
+        tmp[i++] = '0';
+    }
+    else {
+        while (Value > 0) {
+            tmp[i++] = (CHAR)('0' + (Value % 10));
+            Value /= 10;
+        }
+    }
+    if (neg) TbPutChar(Tb, '-');
+    while (i > 0) TbPutChar(Tb, tmp[--i]);
+}
+
+/* Append a zero-padded decimal with minimum width (for frame index) */
+static void
+TbPutDecPad(TRACE_BUFFER* Tb, INT32 Value, INT32 Width)
+{
+    CHAR  tmp[16];
+    INT32 i = 0;
+
+    if (Value == 0) {
+        tmp[i++] = '0';
+    }
+    else {
+        INT32 v = Value;
+        while (v > 0) {
+            tmp[i++] = (CHAR)('0' + (v % 10));
+            v /= 10;
+        }
+    }
+    /* Pad with spaces */
+    while (i < Width) {
+        TbPutChar(Tb, ' ');
+        Width--;
+    }
+    while (i > 0) TbPutChar(Tb, tmp[--i]);
+}
+
+/* Append a UINT64 as 0xHEX */
+static void
+TbPutHex64(TRACE_BUFFER* Tb, UINT64 Value)
+{
+    static const CHAR hex[] = "0123456789ABCDEF";
+    CHAR  tmp[16];
+    INT32 i = 0;
+
+    TbPutStr(Tb, "0x");
+
+    if (Value == 0) {
+        TbPutChar(Tb, '0');
+        return;
+    }
+    while (Value > 0) {
+        tmp[i++] = hex[Value & 0xF];
+        Value >>= 4;
+    }
+    while (i > 0) TbPutChar(Tb, tmp[--i]);
+}
+
+/* Append a UINT32 as plain hex (no 0x prefix, for sub_ addresses) */
+static void
+TbPutHex32Plain(TRACE_BUFFER* Tb, UINT32 Value)
+{
+    static const CHAR hex[] = "0123456789ABCDEF";
+    CHAR  tmp[8];
+    INT32 i = 0;
+
+    if (Value == 0) {
+        TbPutChar(Tb, '0');
+        return;
+    }
+    while (Value > 0) {
+        tmp[i++] = hex[Value & 0xF];
+        Value >>= 4;
+    }
+    while (i > 0) TbPutChar(Tb, tmp[--i]);
+}
+
+/* Null-terminate the buffer (safe even if we overflowed) */
+static void
+TbFinish(TRACE_BUFFER* Tb)
+{
+    if (Tb->Buf) {
+        INT32 end = (Tb->Pos < Tb->Size) ? Tb->Pos : Tb->Size - 1;
+        if (end >= 0)
+            Tb->Buf[end] = '\0';
+    }
+}
+
+/* ================================================================== */
 
 static INT32
 FindModule(UNWIND_CONTEXT* Ctx, UINT64 Address)
@@ -503,6 +656,270 @@ UnwinderAddModule(
     return Idx;
 }
 
+VOID
+UnwinderEnableAutoDiscovery(
+    _Inout_ PUNWIND_CONTEXT Context,
+    _In_    UINT64           MaxScanSize
+)
+{
+    if (MaxScanSize > 0) {
+        Context->AutoDiscover = TRUE;
+        Context->MaxScanSize = MaxScanSize;
+    }
+    else {
+        Context->AutoDiscover = FALSE;
+        Context->MaxScanSize = 0;
+    }
+}
+
+/* ================================================================== */
+/*  PE module name reader (export dir -> debug dir -> "unknown")      */
+/* ================================================================== */
+
+/* CodeView PDB 7.0 signature ("RSDS") */
+#define CV_SIGNATURE_RSDS  0x53445352
+
+#ifndef IMAGE_DEBUG_TYPE_CODEVIEW
+#define IMAGE_DEBUG_TYPE_CODEVIEW  2
+#endif
+
+#ifndef IMAGE_DIRECTORY_ENTRY_DEBUG
+#define IMAGE_DIRECTORY_ENTRY_DEBUG  6
+#endif
+
+typedef struct _CV_INFO_PDB70 {
+    UINT32  CvSignature;    /* CV_SIGNATURE_RSDS                   */
+    UINT8   Guid[16];       /* PDB GUID                            */
+    UINT32  Age;
+    CHAR    PdbFileName[1]; /* Null-terminated, variable length     */
+} CV_INFO_PDB70;
+
+/*
+ * Extract a filename from a full path.
+ *   "C:\build\mydriver.pdb" → "mydriver.pdb"
+ *   "mydriver.pdb"          → "mydriver.pdb"
+ */
+static const CHAR*
+PathGetFilename(const CHAR* Path)
+{
+    const CHAR* last = Path;
+    const CHAR* p = Path;
+    while (*p) {
+        if (*p == '\\' || *p == '/') last = p + 1;
+        p++;
+    }
+    return last;
+}
+
+/*
+ * Strip ".pdb" extension if present, replace with nothing.
+ *   "StackUnwinderTest.pdb" → "StackUnwinderTest"
+ */
+static void
+StripPdbExtension(CHAR* Name)
+{
+    INT32 len = StrLenA(Name);
+    if (len >= 4) {
+        CHAR* ext = &Name[len - 4];
+        if ((ext[0] == '.') &&
+            (ext[1] == 'p' || ext[1] == 'P') &&
+            (ext[2] == 'd' || ext[2] == 'D') &&
+            (ext[3] == 'b' || ext[3] == 'B'))
+        {
+            ext[0] = '\0';
+        }
+    }
+}
+
+/*
+ * Try reading the module name from the PE debug directory.
+ *
+ * Looks for a CodeView RSDS entry which contains the PDB path.
+ * Extracts the filename and strips the .pdb extension:
+ *   "C:\build\StackUnwinderTest.pdb" → "StackUnwinderTest"
+ */
+static BOOLEAN
+ReadPeDebugName(
+    UNWIND_CONTEXT* Ctx,
+    UINT64          ImageBase,
+    IMAGE_NT_HEADERS64* NtHdrs,
+    _Out_writes_(MaxLen) CHAR* NameOut,
+    INT32           MaxLen
+)
+{
+    IMAGE_DATA_DIRECTORY    DbgDir;
+    UINT32                  EntryCount, i;
+    IMAGE_DEBUG_DIRECTORY   DbgEntry;
+    UINT8                   CvBuf[512];
+    CV_INFO_PDB70* Cv;
+    const CHAR* Filename;
+    CHAR                    TmpName[64];
+
+    if (NtHdrs->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_DEBUG)
+        return FALSE;
+
+    DbgDir = NtHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    if (DbgDir.VirtualAddress == 0 || DbgDir.Size == 0)
+        return FALSE;
+
+    EntryCount = DbgDir.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+
+    for (i = 0; i < EntryCount; i++) {
+        UINT64 entryVa = ImageBase + DbgDir.VirtualAddress +
+            (UINT64)i * sizeof(IMAGE_DEBUG_DIRECTORY);
+
+        if (!SafeRead(Ctx, &DbgEntry, entryVa, sizeof(DbgEntry)))
+            continue;
+
+        /* We only care about CodeView entries */
+        if (DbgEntry.Type != IMAGE_DEBUG_TYPE_CODEVIEW)
+            continue;
+
+        /* SizeOfData must be reasonable */
+        if (DbgEntry.SizeOfData < sizeof(CV_INFO_PDB70) ||
+            DbgEntry.SizeOfData > sizeof(CvBuf))
+            continue;
+
+        /* Read the CodeView data (use AddressOfRawData = RVA when loaded) */
+        if (DbgEntry.AddressOfRawData == 0)
+            continue;
+
+        if (!SafeRead(Ctx, CvBuf, ImageBase + DbgEntry.AddressOfRawData,
+            DbgEntry.SizeOfData))
+            continue;
+
+        Cv = (CV_INFO_PDB70*)CvBuf;
+        if (Cv->CvSignature != CV_SIGNATURE_RSDS)
+            continue;
+
+        /* Ensure the PDB filename is null-terminated within the buffer */
+        CvBuf[DbgEntry.SizeOfData - 1] = '\0';
+
+        /* Sanity: first char of filename should be printable */
+        if (Cv->PdbFileName[0] < 0x20 || Cv->PdbFileName[0] > 0x7E)
+            continue;
+
+        /* Extract just the filename, strip .pdb extension */
+        Filename = PathGetFilename(Cv->PdbFileName);
+        StrCopyA(TmpName, Filename, sizeof(TmpName));
+        StripPdbExtension(TmpName);
+
+        if (TmpName[0] != '\0') {
+            StrCopyA(NameOut, TmpName, MaxLen);
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+/*
+ * Read the module name for a PE image. Tries in order:
+ *   1. Export directory Name field  (DLLs, ntoskrnl, etc.)
+ *   2. Debug directory PDB filename (EXEs, anything with /Zi)
+ *   3. Falls back to "unknown"
+ */
+static void
+ReadPeDllName(
+    UNWIND_CONTEXT* Ctx,
+    UINT64          ImageBase,
+    _Out_writes_(MaxLen) CHAR* NameOut,
+    INT32           MaxLen
+)
+{
+    IMAGE_DOS_HEADER        DosHdr;
+    IMAGE_NT_HEADERS64      NtHdrs;
+    IMAGE_DATA_DIRECTORY    ExpDir;
+    IMAGE_EXPORT_DIRECTORY  ExportDir;
+    UINT32                  NameRva;
+    CHAR                    TmpName[64];
+
+    NameOut[0] = '\0';
+
+    /* Parse PE headers (shared by both strategies) */
+    if (!SafeRead(Ctx, &DosHdr, ImageBase, sizeof(DosHdr)))
+        goto fallback;
+    if (DosHdr.e_magic != IMAGE_DOS_SIGNATURE)
+        goto fallback;
+
+    if (!SafeRead(Ctx, &NtHdrs, ImageBase + DosHdr.e_lfanew, sizeof(NtHdrs)))
+        goto fallback;
+    if (NtHdrs.Signature != IMAGE_NT_SIGNATURE)
+        goto fallback;
+    if (NtHdrs.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        goto fallback;
+
+    /* Strategy 1: Export directory Name */
+    if (NtHdrs.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+        ExpDir = NtHdrs.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (ExpDir.VirtualAddress != 0 && ExpDir.Size != 0) {
+            if (SafeRead(Ctx, &ExportDir, ImageBase + ExpDir.VirtualAddress, sizeof(ExportDir))) {
+                NameRva = ExportDir.Name;
+                if (NameRva != 0) {
+                    memset(TmpName, 0, sizeof(TmpName));
+                    if (SafeRead(Ctx, TmpName, ImageBase + NameRva, sizeof(TmpName) - 1)) {
+                        TmpName[sizeof(TmpName) - 1] = '\0';
+                        if (TmpName[0] >= 0x20 && TmpName[0] <= 0x7E) {
+                            StrCopyA(NameOut, TmpName, MaxLen);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Strategy 2: Debug directory PDB filename */
+    if (ReadPeDebugName(Ctx, ImageBase, &NtHdrs, NameOut, MaxLen))
+        return;
+
+fallback:
+    StrCopyA(NameOut, "unknown", MaxLen);
+}
+
+/* ================================================================== */
+/*  Inline module discovery                                           */
+/* ================================================================== */
+
+/*
+ * TryDiscoverModule — given an address with no known module, scan
+ * backward to find the PE base, read the DLL name from exports,
+ * register the module, and parse .pdata + exports.
+ *
+ * Returns the new module index, or -1 on failure.
+ */
+static INT32
+TryDiscoverModule(
+    UNWIND_CONTEXT* Ctx,
+    UINT64          Address
+)
+{
+    UINT64  Base, Size;
+    CHAR    DllName[64];
+    INT32   ModIdx;
+
+    if (!UnwinderFindImageBase(Ctx, Address, Ctx->MaxScanSize, &Base, &Size))
+        return -1;
+
+    /* Maybe another frame already triggered discovery of this image */
+    ModIdx = FindModule(Ctx, Address);
+    if (ModIdx >= 0)
+        return ModIdx;
+
+    /* Read internal DLL name from PE export directory */
+    ReadPeDllName(Ctx, Base, DllName, sizeof(DllName));
+
+    ModIdx = UnwinderAddModule(Ctx, Base, Size, DllName);
+    if (ModIdx < 0)
+        return -1;
+
+    /* Pre-parse .pdata and exports so they're ready for this frame */
+    ParsePePdata(Ctx, ModIdx);
+    ParsePeExports(Ctx, ModIdx);
+
+    return ModIdx;
+}
+
 INT32
 UnwinderWalk(
     _Inout_ UNWIND_CONTEXT* Context,
@@ -534,6 +951,14 @@ UnwinderWalk(
         Frame->Rip = CurrentRip;
         Frame->Rsp = Context->Gpr[GPR_RSP];
         ModIdx = FindModule(Context, CurrentRip);
+
+        /* Auto-discover: if RIP doesn't belong to any known module,
+           scan backward to find the PE base, read the DLL name from
+           the export directory, and register it — all inline. */
+        if (ModIdx < 0 && Context->AutoDiscover && CurrentRip != 0) {
+            ModIdx = TryDiscoverModule(Context, CurrentRip);
+        }
+
         Frame->ModuleIndex = ModIdx;
         Frame->Rva = (ModIdx >= 0)
             ? (CurrentRip - Context->Modules[ModIdx].BaseAddress)
@@ -556,6 +981,21 @@ UnwinderWalk(
             }
         }
 
+        /* Resolve export name inline if auto-discovery is on */
+        if (ModIdx >= 0 && Context->AutoDiscover && Frame->FunctionName[0] == '\0') {
+            if (Context->Modules[ModIdx].ExportsParsed ||
+                ParsePeExports(Context, ModIdx)) {
+                FindNearestExport(
+                    Context,
+                    ModIdx,
+                    (UINT32)Frame->Rva,
+                    Frame->FunctionName,
+                    sizeof(Frame->FunctionName),
+                    &Frame->FunctionOffset
+                );
+            }
+        }
+
         /* Pop return address */
         ReturnAddr = 0;
         if (!ReadU64(Context, Context->Gpr[GPR_RSP], &ReturnAddr))
@@ -573,6 +1013,162 @@ UnwinderWalk(
     }
 
     return Context->FrameCount;
+}
+
+/* ================================================================== */
+/*  Image base discovery (no OS structures needed)                    */
+/* ================================================================== */
+
+/*
+ * Scan backward from `Address` on page-aligned boundaries looking
+ * for a valid MZ + PE header.  This works because PE images are
+ * always loaded at page-aligned addresses.
+ */
+BOOLEAN
+UnwinderFindImageBase(
+    _Inout_ PUNWIND_CONTEXT Context,
+    _In_    UINT64           Address,
+    _In_    UINT64           MaxScanSize,
+    _Out_   UINT64* ImageBase,
+    _Out_   UINT64* SizeOfImage
+)
+{
+    UINT64              Page;
+    UINT64              Limit;
+    IMAGE_DOS_HEADER    DosHdr;
+    IMAGE_NT_HEADERS64  NtHdrs;
+
+    *ImageBase = 0;
+    *SizeOfImage = 0;
+
+    /* Align down to page boundary */
+    Page = Address & ~(UINT64)0xFFF;
+
+    /* Don't scan below this address */
+    Limit = (Page > MaxScanSize) ? (Page - MaxScanSize) : 0;
+
+    while (Page >= Limit) {
+
+        /* Try reading a DOS header at this page */
+        if (!SafeRead(Context, &DosHdr, Page, sizeof(DosHdr)))
+            goto next;
+
+        if (DosHdr.e_magic != IMAGE_DOS_SIGNATURE)
+            goto next;
+
+        /* Sanity check e_lfanew — must be reasonable and within
+           the first page-ish of the image */
+        if (DosHdr.e_lfanew < sizeof(IMAGE_DOS_HEADER) ||
+            DosHdr.e_lfanew > 0x1000)
+            goto next;
+
+        /* Try reading NT headers */
+        if (!SafeRead(Context, &NtHdrs, Page + DosHdr.e_lfanew, sizeof(NtHdrs)))
+            goto next;
+
+        if (NtHdrs.Signature != IMAGE_NT_SIGNATURE)
+            goto next;
+
+        if (NtHdrs.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+            goto next;
+
+        /* Verify that our original address actually falls within
+           this image's claimed range */
+        if (Address >= Page &&
+            Address < Page + NtHdrs.OptionalHeader.SizeOfImage)
+        {
+            *ImageBase = Page;
+            *SizeOfImage = NtHdrs.OptionalHeader.SizeOfImage;
+            return TRUE;
+        }
+
+    next:
+        if (Page == 0) break;
+        Page -= 0x1000;
+    }
+
+    return FALSE;
+}
+
+/*
+ * After UnwinderWalk, discover and register modules for frames
+ * that don't yet belong to any known module.
+ *
+ * Also re-links those frames to the newly discovered module and
+ * re-runs .pdata lookup so the next UnwinderResolveExports has
+ * full function info.
+ */
+INT32
+UnwinderDiscoverModules(
+    _Inout_ PUNWIND_CONTEXT Context,
+    _In_    UINT64           MaxScanSize
+)
+{
+    INT32  i, NewCount = 0;
+    UINT64 Base, Size;
+
+    for (i = 0; i < Context->FrameCount; i++) {
+        STACK_FRAME_ENTRY* Frame = &Context->Frames[i];
+
+        /* Skip frames that already have a module */
+        if (Frame->ModuleIndex >= 0)
+            continue;
+
+        /* Skip null RIPs */
+        if (Frame->Rip == 0)
+            continue;
+
+        /* Check if another frame already discovered this module */
+        INT32 Existing = FindModule(Context, Frame->Rip);
+        if (Existing >= 0) {
+            Frame->ModuleIndex = Existing;
+            Frame->Rva = Frame->Rip - Context->Modules[Existing].BaseAddress;
+            continue;
+        }
+
+        /* Scan backward for PE header */
+        if (!UnwinderFindImageBase(Context, Frame->Rip, MaxScanSize, &Base, &Size))
+            continue;
+
+        /* Register the new module (no name available — use empty) */
+        INT32 ModIdx = UnwinderAddModule(Context, Base, Size, "unknown");
+        if (ModIdx < 0)
+            continue;
+
+        NewCount++;
+
+        /* Re-link this frame and any subsequent frames in the same image */
+        {
+            INT32 j;
+            for (j = i; j < Context->FrameCount; j++) {
+                STACK_FRAME_ENTRY* f2 = &Context->Frames[j];
+                if (f2->ModuleIndex >= 0)
+                    continue;
+                if (f2->Rip >= Base && f2->Rip < Base + Size) {
+                    f2->ModuleIndex = ModIdx;
+                    f2->Rva = f2->Rip - Base;
+                }
+            }
+        }
+
+        /* Parse .pdata now so FunctionRva/Offset get filled in */
+        if (ParsePePdata(Context, ModIdx)) {
+            INT32 j;
+            for (j = i; j < Context->FrameCount; j++) {
+                STACK_FRAME_ENTRY* f2 = &Context->Frames[j];
+                if (f2->ModuleIndex != ModIdx)
+                    continue;
+                IMAGE_RUNTIME_FUNCTION_ENTRY Rf;
+                UINT32 Rva = (UINT32)f2->Rva;
+                if (FindRuntimeFunction(Context, ModIdx, Rva, &Rf)) {
+                    f2->FunctionRva = Rf.BeginAddress;
+                    f2->FunctionOffset = Rva - Rf.BeginAddress;
+                }
+            }
+        }
+    }
+
+    return NewCount;
 }
 
 VOID
@@ -603,17 +1199,22 @@ UnwinderResolveExports(
     }
 }
 
-VOID
-UnwinderPrintTrace(
-    _In_ PUNWIND_CONTEXT Context,
-    _In_ PRINT_FN        PrintFn
-)
+/* ================================================================== */
+/*  Trace formatting                                                  */
+/* ================================================================== */
+
+/*
+ * Internal: write the full trace into a TRACE_BUFFER.
+ * Used by both the sizing pass (Buf==NULL) and the real pass.
+ */
+static void
+FormatTraceInternal(PUNWIND_CONTEXT Context, TRACE_BUFFER* Tb)
 {
     INT32 i;
 
-    if (!PrintFn) return;
-
-    PrintFn("\n===== Stack Trace (%d frames) =====\n", Context->FrameCount);
+    TbPutStr(Tb, "\n===== Stack Trace (");
+    TbPutDec(Tb, Context->FrameCount);
+    TbPutStr(Tb, " frames) =====\n");
 
     for (i = 0; i < Context->FrameCount; i++) {
         STACK_FRAME_ENTRY* f = &Context->Frames[i];
@@ -621,24 +1222,66 @@ UnwinderPrintTrace(
             ? Context->Modules[f->ModuleIndex].Name
             : "???";
 
+        TbPutStr(Tb, "  [");
+        TbPutDecPad(Tb, i, 2);
+        TbPutStr(Tb, "]  ");
+
         if (f->FunctionName[0] != '\0') {
-            PrintFn("  [%2d]  %s!%s+0x%llX  (0x%llX)\n",
-                i, modName, f->FunctionName,
-                (unsigned long long)f->FunctionOffset,
-                (unsigned long long)f->Rva);
+            /* module!FunctionName+0xOffset  (0xRva) */
+            TbPutStr(Tb, modName);
+            TbPutChar(Tb, '!');
+            TbPutStr(Tb, f->FunctionName);
+            TbPutStr(Tb, "+");
+            TbPutHex64(Tb, f->FunctionOffset);
+            TbPutStr(Tb, "  (");
+            TbPutHex64(Tb, f->Rva);
+            TbPutChar(Tb, ')');
         }
         else if (f->FunctionRva != 0) {
-            PrintFn("  [%2d]  %s!sub_%X+0x%llX  (0x%llX)\n",
-                i, modName, (unsigned)f->FunctionRva,
-                (unsigned long long)f->FunctionOffset,
-                (unsigned long long)f->Rva);
+            /* module!sub_XXXX+0xOffset  (0xRva) */
+            TbPutStr(Tb, modName);
+            TbPutStr(Tb, "!sub_");
+            TbPutHex32Plain(Tb, f->FunctionRva);
+            TbPutStr(Tb, "+");
+            TbPutHex64(Tb, f->FunctionOffset);
+            TbPutStr(Tb, "  (");
+            TbPutHex64(Tb, f->Rva);
+            TbPutChar(Tb, ')');
         }
         else {
-            PrintFn("  [%2d]  %s+0x%llX\n",
-                i, modName,
-                (unsigned long long)f->Rva);
+            /* module+0xRva */
+            TbPutStr(Tb, modName);
+            TbPutStr(Tb, "+");
+            TbPutHex64(Tb, f->Rva);
         }
+
+        TbPutChar(Tb, '\n');
     }
 
-    PrintFn("===================================\n");
+    TbPutStr(Tb, "===================================\n");
+}
+
+INT32
+UnwinderFormatTrace(
+    _In_                              PUNWIND_CONTEXT Context,
+    _Out_writes_opt_(BufSize) CHAR* Buffer,
+    _In_                              INT32           BufSize
+)
+{
+    TRACE_BUFFER Tb;
+
+    if (!Buffer || BufSize <= 0) {
+        /* Sizing pass — count characters with a NULL buffer */
+        TbInit(&Tb, (CHAR*)0, 0);
+        FormatTraceInternal(Context, &Tb);
+        return Tb.Pos + 1;   /* +1 for null terminator */
+    }
+
+    /* Real pass — write into the caller's buffer */
+    TbInit(&Tb, Buffer, BufSize);
+    FormatTraceInternal(Context, &Tb);
+    TbFinish(&Tb);
+
+    /* Return characters written (not counting the terminator) */
+    return (Tb.Pos < BufSize) ? Tb.Pos : BufSize - 1;
 }
