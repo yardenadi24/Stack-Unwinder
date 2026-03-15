@@ -696,8 +696,8 @@ typedef struct _CV_INFO_PDB70 {
 
 /*
  * Extract a filename from a full path.
- *   "C:\build\mydriver.pdb" → "mydriver.pdb"
- *   "mydriver.pdb"          → "mydriver.pdb"
+ *   "C:\build\mydriver.pdb" -> "mydriver.pdb"
+ *   "mydriver.pdb"          -> "mydriver.pdb"
  */
 static const CHAR*
 PathGetFilename(const CHAR* Path)
@@ -713,7 +713,7 @@ PathGetFilename(const CHAR* Path)
 
 /*
  * Strip ".pdb" extension if present, replace with nothing.
- *   "StackUnwinderTest.pdb" → "StackUnwinderTest"
+ *   "StackUnwinderTest.pdb" -> "StackUnwinderTest"
  */
 static void
 StripPdbExtension(CHAR* Name)
@@ -736,7 +736,7 @@ StripPdbExtension(CHAR* Name)
  *
  * Looks for a CodeView RSDS entry which contains the PDB path.
  * Extracts the filename and strips the .pdb extension:
- *   "C:\build\StackUnwinderTest.pdb" → "StackUnwinderTest"
+ *   "C:\build\StackUnwinderTest.pdb" -> "StackUnwinderTest"
  */
 static BOOLEAN
 ReadPeDebugName(
@@ -981,18 +981,29 @@ UnwinderWalk(
             }
         }
 
-        /* Resolve export name inline if auto-discovery is on */
+        /*
+         * Resolve export name inline if auto-discovery is on.
+         *
+         * FIX: Use a local ExportOffset and only write it back to
+         * Frame->FunctionOffset on success.  Previously, a failed
+         * FindNearestExport call (EXE has no exports) would zero
+         * Frame->FunctionOffset, discarding the correct .pdata offset
+         * computed just above.
+         */
         if (ModIdx >= 0 && Context->AutoDiscover && Frame->FunctionName[0] == '\0') {
             if (Context->Modules[ModIdx].ExportsParsed ||
                 ParsePeExports(Context, ModIdx)) {
-                FindNearestExport(
+                UINT64 ExportOffset = 0;
+                if (FindNearestExport(
                     Context,
                     ModIdx,
                     (UINT32)Frame->Rva,
                     Frame->FunctionName,
                     sizeof(Frame->FunctionName),
-                    &Frame->FunctionOffset
-                );
+                    &ExportOffset))
+                {
+                    Frame->FunctionOffset = ExportOffset;
+                }
             }
         }
 
@@ -1188,14 +1199,26 @@ UnwinderResolveExports(
         if (!ParsePeExports(Context, ModIdx))
             continue;
 
-        FindNearestExport(
-            Context,
-            ModIdx,
-            (UINT32)Frame->Rva,
-            Frame->FunctionName,
-            sizeof(Frame->FunctionName),
-            &Frame->FunctionOffset
-        );
+        /*
+         * FIX: Use a local ExportOffset and only write it back to
+         * Frame->FunctionOffset on success.  Previously, a failed
+         * FindNearestExport call (EXE has no exports) would zero
+         * Frame->FunctionOffset, discarding the correct .pdata offset
+         * computed during UnwinderWalk.
+         */
+        {
+            UINT64 ExportOffset = 0;
+            if (FindNearestExport(
+                Context,
+                ModIdx,
+                (UINT32)Frame->Rva,
+                Frame->FunctionName,
+                sizeof(Frame->FunctionName),
+                &ExportOffset))
+            {
+                Frame->FunctionOffset = ExportOffset;
+            }
+        }
     }
 }
 
