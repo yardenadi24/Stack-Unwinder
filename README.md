@@ -13,6 +13,9 @@ The output of the tracer:
 ===================================
 
 pdbs.txt example:
+
 ntoskrnl.exe=C:\symbols\ntkrnlmp.pdb
+
 unknown=C:\mydriver\mydriver.pdb
+
 StackUnwinderTest.exe=C:\build\StackUnwinderTest.pdb
